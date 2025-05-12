@@ -1,5 +1,6 @@
 # Streamlit secrets
-.streamlit/
+# Ignoruj tylko pliki sekretów, nie cały katalog
+.streamlit/secrets.toml
 
 # Python environment
 env/
