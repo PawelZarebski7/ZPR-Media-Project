@@ -10,11 +10,11 @@ import base64
 
 # Konfiguracja AWS
 def get_aws_credentials():
-    # W środowisku produkcyjnym lepiej używać IAM roles
+    # Odczytanie danych z secrets.toml - nowa struktura
     return {
-        'aws_access_key_id': st.secrets.get("AWS_ACCESS_KEY_ID", os.environ.get("AWS_ACCESS_KEY_ID")),
-        'aws_secret_access_key': st.secrets.get("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY")),
-        'region_name': st.secrets.get("AWS_REGION", os.environ.get("AWS_REGION", "eu-central-1"))
+        'aws_access_key_id': st.secrets["aws"]["AWS_ACCESS_KEY_ID"],
+        'aws_secret_access_key': st.secrets["aws"]["AWS_SECRET_ACCESS_KEY"],
+        'region_name': st.secrets["aws"]["AWS_REGION"]
     }
 
 # Inicjalizacja klientów AWS
@@ -123,9 +123,9 @@ def generate_description_and_tags(image_analysis):
     """
     
     try:
-        # Wywołanie Amazon Bedrock (Claude)
+        # Wywołanie Amazon Bedrock (Claude) - zaktualizowane ID profilu inferencyjnego
         response = bedrock.invoke_model(
-            modelId='anthropic.claude-3-5-sonnet-20240620-v1:0',
+            modelId='eu.anthropic.claude-3-7-sonnet-20250219-v1:0',  # Profil inferencyjny Claude 3.7 Sonnet
             body=json.dumps({
                 'anthropic_version': 'bedrock-2023-05-31',
                 'max_tokens': 1000,
@@ -153,116 +153,72 @@ def generate_description_and_tags(image_analysis):
             'tags': []
         }
 
-# Funkcja do obsługi pytań FAQ
+# Uproszona funkcja do obsługi pytań FAQ bez użycia embeddings
 def answer_question(question):
-    clients = init_aws_clients()
-    bedrock = clients['bedrock']
-    dynamodb = clients['dynamodb']
+    # Przykładowe FAQ
+    example_faqs = [
+        {
+            'question': 'Jak działa ten asystent?',
+            'answer': 'Asystent analizuje przesłane zdjęcia używając AI, generuje opisy i tagi, oraz odpowiada na pytania z FAQ.'
+        },
+        {
+            'question': 'Czy moje zdjęcia są przechowywane?',
+            'answer': 'Zdjęcia są przechowywane w bezpieczny sposób w chmurze AWS, z kontrolą dostępu.'
+        },
+        {
+            'question': 'Jakie rodzaje zdjęć mogę analizować?',
+            'answer': 'Możesz analizować różne typy zdjęć, ale system działa najlepiej ze zdjęciami osób, zwierząt, krajobrazów i przedmiotów.'
+        }
+    ]
     
-    # Generowanie embeddingu dla pytania użytkownika
-    try:
-        embed_response = bedrock.invoke_model(
-            modelId='amazon.titan-embed-text-v1',
-            body=json.dumps({
-                'inputText': question,
-                'embeddingConfig': {
-                    'outputDimension': 1536
-                }
-            })
-        )
+    # Znalezienie najbardziej podobnego pytania
+    best_match = None
+    highest_score = 0
+    
+    for faq in example_faqs:
+        # Proste porównanie słów
+        faq_words = set(faq['question'].lower().split())
+        question_words = set(question.lower().split())
+        common_words = faq_words.intersection(question_words)
         
-        embed_body = json.loads(embed_response['body'].read())
-        question_embedding = embed_body['embedding']
+        if len(faq_words) > 0:
+            score = len(common_words) / len(faq_words)
+            if score > highest_score:
+                highest_score = score
+                best_match = faq
+    
+    if highest_score > 0.5:  # Próg podobieństwa
+        return {
+            'matched_question': best_match['question'],
+            'answer': best_match['answer'],
+            'similarity': highest_score
+        }
+    else:
+        # Generowanie odpowiedzi za pomocą Claude
+        clients = init_aws_clients()
+        bedrock = clients['bedrock']
         
-        # Przeszukanie bazy FAQ
-        faq_table = dynamodb.Table('FAQ')
-        all_items = faq_table.scan()['Items']
+        prompt = f"""
+        Użytkownik zadał pytanie: "{question}"
         
-        # Jeśli baza FAQ jest pusta, użyjemy hardcoded przykładów do demonstracji
-        if not all_items:
-            example_faqs = [
-                {
-                    'question': 'Jak działa ten asystent?',
-                    'answer': 'Asystent analizuje przesłane zdjęcia używając AI, generuje opisy i tagi, oraz odpowiada na pytania z FAQ.'
-                },
-                {
-                    'question': 'Czy moje zdjęcia są przechowywane?',
-                    'answer': 'Zdjęcia są przechowywane w bezpieczny sposób w chmurze AWS, z kontrolą dostępu.'
-                },
-                {
-                    'question': 'Jakie rodzaje zdjęć mogę analizować?',
-                    'answer': 'Możesz analizować różne typy zdjęć, ale system działa najlepiej ze zdjęciami osób, zwierząt, krajobrazów i przedmiotów.'
-                }
-            ]
-            
-            # Symulacja embeddingów dla przykładowych FAQ
-            example_faqs_with_embeddings = []
-            for faq in example_faqs:
-                embed_resp = bedrock.invoke_model(
-                    modelId='amazon.titan-embed-text-v1',
-                    body=json.dumps({
-                        'inputText': faq['question'],
-                        'embeddingConfig': {
-                            'outputDimension': 1536
-                        }
-                    })
-                )
-                
-                embed_body = json.loads(embed_resp['body'].read())
-                faq['embedding'] = embed_body['embedding']
-                example_faqs_with_embeddings.append(faq)
-            
-            all_items = example_faqs_with_embeddings
+        Oto pytania i odpowiedzi z naszego FAQ:
         
-        # Obliczenie podobieństwa między pytaniem użytkownika a pytaniami z FAQ
-        similarities = []
-        for item in all_items:
-            faq_embedding = item['embedding']
-            # Obliczenie podobieństwa kosinusowego
-            dot_product = sum(a * b for a, b in zip(question_embedding, faq_embedding))
-            magnitude1 = sum(a * a for a in question_embedding) ** 0.5
-            magnitude2 = sum(b * b for b in faq_embedding) ** 0.5
-            
-            if magnitude1 * magnitude2 == 0:
-                similarity = 0
-            else:
-                similarity = dot_product / (magnitude1 * magnitude2)
-            
-            similarities.append({
-                'question': item['question'],
-                'answer': item['answer'],
-                'similarity': similarity
-            })
+        Q: Jak działa ten asystent?
+        A: Asystent analizuje przesłane zdjęcia używając AI, generuje opisy i tagi, oraz odpowiada na pytania z FAQ.
         
-        # Sortowanie po podobieństwie
-        similarities.sort(key=lambda x: x['similarity'], reverse=True)
-        best_match = similarities[0]
+        Q: Czy moje zdjęcia są przechowywane?
+        A: Zdjęcia są przechowywane w bezpieczny sposób w chmurze AWS, z kontrolą dostępu.
         
-        # Jeśli podobieństwo jest wystarczająco wysokie, zwracamy bezpośrednio odpowiedź z FAQ
-        if best_match['similarity'] > 0.85:
-            return {
-                'matched_question': best_match['question'],
-                'answer': best_match['answer'],
-                'similarity': best_match['similarity']
-            }
-        else:
-            # W przeciwnym razie, używamy LLM do generowania odpowiedzi
-            relevant_faqs = [f"Q: {s['question']}\nA: {s['answer']}" for s in similarities[:3]]
-            context = "\n\n".join(relevant_faqs)
-            
-            prompt = f"""
-            Użytkownik zadał pytanie: "{question}"
-            
-            Oto najbardziej zbliżone pytania i odpowiedzi z naszego FAQ:
-            
-            {context}
-            
-            Biorąc pod uwagę te informacje, udziel najlepszej możliwej odpowiedzi na pytanie użytkownika.
-            Jeśli pytanie nie jest związane z dostępnymi informacjami, powiedz, że nie masz wystarczających danych aby odpowiedzieć.
-            """
-            
+        Q: Jakie rodzaje zdjęć mogę analizować?
+        A: Możesz analizować różne typy zdjęć, ale system działa najlepiej ze zdjęciami osób, zwierząt, krajobrazów i przedmiotów.
+        
+        Biorąc pod uwagę te informacje, udziel najlepszej możliwej odpowiedzi na pytanie użytkownika.
+        Jeśli pytanie nie jest związane z dostępnymi informacjami, powiedz, że nie masz wystarczających danych aby odpowiedzieć.
+        """
+        
+        try:
             llm_response = bedrock.invoke_model(
-                modelId='anthropic.claude-3-5-sonnet-20240620-v1:0',
+                modelId='eu.anthropic.claude-3-7-sonnet-20250219-v1:0',
                 body=json.dumps({
                     'anthropic_version': 'bedrock-2023-05-31',
                     'max_tokens': 1000,
@@ -276,14 +232,13 @@ def answer_question(question):
             
             return {
                 'generated_answer': generated_answer,
-                'relevant_faqs': [s['question'] for s in similarities[:3]]
+                'relevant_faqs': [faq['question'] for faq in example_faqs]
             }
-    
-    except Exception as e:
-        st.error(f"Błąd przy odpowiadaniu na pytanie: {str(e)}")
-        return {
-            'error': f"Nie udało się przetworzyć pytania: {str(e)}"
-        }
+        except Exception as e:
+            st.error(f"Błąd przy generowaniu odpowiedzi: {str(e)}")
+            return {
+                'error': f"Nie udało się przetworzyć pytania: {str(e)}"
+            }
 
 # Zapisanie danych w DynamoDB
 def save_to_dynamodb(bucket, key, result):
@@ -293,6 +248,13 @@ def save_to_dynamodb(bucket, key, result):
     try:
         table = dynamodb.Table('ImageDescriptions')
         
+        # Sprawdź czy tabela istnieje
+        try:
+            table.table_status
+        except Exception as e:
+            st.warning(f"Problem z tabelą DynamoDB: {str(e)}")
+            return False
+            
         item = {
             'image_id': key,
             's3_bucket': bucket,
@@ -340,7 +302,7 @@ def main():
         if uploaded_file is not None:
             # Wyświetlanie przesłanego zdjęcia
             image = Image.open(uploaded_file)
-            st.image(image, caption="Przesłane zdjęcie", use_column_width=True)
+            st.image(image, caption="Przesłane zdjęcie", use_container_width=True)
             st.session_state.uploaded_image = image
             
             # Przycisk do analizy
@@ -348,19 +310,20 @@ def main():
                 with st.spinner("Analizuję zdjęcie..."):
                     # Konwersja obrazu do bytesIO dla AWS
                     buf = io.BytesIO()
+                    
+                    # Konwersja obrazu z RGBA do RGB, jeśli jest to konieczne
+                    if image.mode == 'RGBA':
+                        image = image.convert('RGB')
+                    
                     image.save(buf, format='JPEG')
                     image_bytes = buf.getvalue()
                     
-                    # Bucket S3 - w produkcji użyj rzeczywistego bucketa
-                    bucket_name = "my-image-assistant-bucket"
+                    # Bucket S3 - pobierz z konfiguracji
+                    bucket_name = st.secrets["aws"]["S3_BUCKET_NAME"]
                     
                     try:
-                        # Przesłanie do S3 (w trybie demonstracyjnym możemy pominąć)
-                        file_key = f"demo-image-{uuid.uuid4()}.jpg"
-                        
-                        # Jeśli mamy skonfigurowany AWS, przesyłamy rzeczywiście
-                        if get_aws_credentials()['aws_access_key_id']:
-                            file_key = upload_to_s3(image_bytes, bucket_name)
+                        # Przesłanie do S3
+                        file_key = upload_to_s3(image_bytes, bucket_name)
                             
                         # Analiza obrazu
                         image_analysis = analyze_image(bucket_name, file_key)
@@ -368,9 +331,8 @@ def main():
                         # Generowanie opisu i tagów
                         result = generate_description_and_tags(image_analysis)
                         
-                        # Zapis do DynamoDB (jeśli mamy skonfigurowany AWS)
-                        if get_aws_credentials()['aws_access_key_id']:
-                            save_to_dynamodb(bucket_name, file_key, result)
+                        # Zapis do DynamoDB
+                        save_to_dynamodb(bucket_name, file_key, result)
                         
                         # Zapisanie wyników w stanie sesji
                         st.session_state.image_description = result['description']
@@ -378,11 +340,6 @@ def main():
                         
                     except Exception as e:
                         st.error(f"Wystąpił błąd: {str(e)}")
-                        
-                        # Dla demonstracji, jeśli AWS nie jest skonfigurowany
-                        st.warning("Używam danych demonstracyjnych (AWS nie skonfigurowany)")
-                        st.session_state.image_description = "To zdjęcie przedstawia górski krajobraz z jeziorem otoczonym przez sosnowy las. W tle widać ośnieżone szczyty gór, a nad nimi błękitne niebo z kilkoma pierzastymi chmurami. Na pierwszym planie widoczny jest fragment kamienistej plaży."
-                        st.session_state.image_tags = ["góry", "jezioro", "las", "krajobraz", "natura", "niebo", "chmury", "skały", "odbicie", "spokój"]
             
             # Wyświetlanie wyników analizy
             if st.session_state.image_description:
@@ -407,12 +364,6 @@ def main():
                     st.session_state.faq_answer = answer_data
                 except Exception as e:
                     st.error(f"Wystąpił błąd: {str(e)}")
-                    
-                    # Dla demonstracji, jeśli AWS nie jest skonfigurowany
-                    st.warning("Używam danych demonstracyjnych (AWS nie skonfigurowany)")
-                    st.session_state.faq_answer = {
-                        'generated_answer': "Ten asystent analizuje przesłane zdjęcia używając sztucznej inteligencji, generuje szczegółowe opisy i tagi, które pomagają w kategoryzacji i wyszukiwaniu. Przesłane zdjęcia są przetwarzane przez usługi AWS Rekognition oraz Amazon Bedrock (Claude) do analizy zawartości i generowania opisów naturalnym językiem."
-                    }
         
         # Wyświetlanie odpowiedzi na pytanie
         if st.session_state.faq_answer:
